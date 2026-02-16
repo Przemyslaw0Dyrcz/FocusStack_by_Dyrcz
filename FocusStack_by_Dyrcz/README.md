@@ -1,6 +1,5 @@
 # FocusStack by Dyrcz
 
-Project split into logical Python modules for focus-stacking + object segmentation using FastSAM.
 
 ## Contents
 - `focusstack/` — Python package with modules (io, alignment, segmentation, filters, merging, composition, main)
@@ -26,20 +25,8 @@ Project split into logical Python modules for focus-stacking + object segmentati
    ```
 
 ## Notes / caveats
-- The split code implements the same logic as your monolithic script but split into modules.
 - You must have compatible versions of `torch` and `ultralytics` (and a CUDA-capable GPU + drivers if using `--device cuda`).
 - If model inference fails, check `torch.cuda.is_available()` and the `fastsam` model path.
 - The implementation expects images of similar resolution; if images vary, they will be resized to first image's size.
 
-## Git + GitHub
-Initialize git and push:
-```bash
-git init
-git add .
-git commit -m "Initial import: FocusStack by Dyrcz"
-# create repo on GitHub and add remote, then:
-git remote add origin git@github.com:YOURUSER/FocusStack_by_Dyrcz.git
-git branch -M main
-git push -u origin main
-```
 
