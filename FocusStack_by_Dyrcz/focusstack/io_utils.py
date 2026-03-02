@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List
 import cv2 as cv
 import numpy as np
+from .utils import is_inside
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -49,3 +50,9 @@ def save_jpg(path: Path, bgr: np.ndarray, q: int = 92) -> None:
 def save_mask(path: Path, mask01: np.ndarray) -> None:
     ensure_dir(path.parent)
     cv.imwrite(str(path), (mask01.astype(np.uint8) * 255))
+
+def is_inside(mask_a: np.ndarray, mask_b: np.ndarray) -> bool:
+    """Check if mask_a is fully inside mask_b"""
+    a = (mask_a > 0)
+    b = (mask_b > 0)
+    return np.all(np.logical_or(~a, b))

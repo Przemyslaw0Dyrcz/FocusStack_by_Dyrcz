@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict
 from .refs import RefObj
 from .segmentation import SegMask
+import numpy as np
 
 @dataclass
 class TrackDet:

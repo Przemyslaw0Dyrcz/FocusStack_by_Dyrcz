@@ -2,7 +2,6 @@ from pathlib import Path
 import argparse
 from dataclasses import dataclass
 import torch
-
 # local imports
 from .io_utils import ensure_dir, list_images, read_images, save_png, save_jpg, save_mask
 from .alignment import align_ecc_affine
@@ -11,12 +10,14 @@ from .refs import refs_from_base_stack, RefObj
 from .assignment import assign_masks_to_refs
 from .tracking import tracks_from_assignments, Track
 from .corefill import best_frame_for_track, track_mask_core_and_fill
-from .union import track_union_mask, best_frame_for_union_mask, clamp_union_to_best
+from .union import track_union_mask, best_frame_for_union_mask, clamp_union_to_best, _det_mask_at_t
 from .composition import hard_paste_then_feather
+from .advanced_patch import patch_fill_background, build_dynamic_masks, build_masks_by_category
 from .filtering import FilterCfg, filter_masks
 from .merging import MergeCfg, merge_similar_masks
 from .segmentation import segment_fastsam_single, SegMask
-
+from .utils import *
+@dataclass
 @dataclass
 class ObjPack:
     ref_id: int
@@ -26,6 +27,78 @@ class ObjPack:
     final_mask: 'np.ndarray'
     area: int
     is_bg: bool
+
+
+def classify_track(track, h, w, pos_thresh, area_thresh):
+    import numpy as np, cv2 as cv
+
+    if len(track.dets) == 0:
+        return "rejected", 0.0, 0.0
+
+    masks=[]
+    centroids=[]
+    areas=[]
+
+    for d in track.dets:
+        m=(d.mask01>0).astype(np.uint8)
+        masks.append(m)
+
+        M=cv.moments(m)
+        if M.get("m00",0)>0:
+            cx=float(M["m10"])/M["m00"]
+            cy=float(M["m01"])/M["m00"]
+        else:
+            cx,cy=0.0,0.0
+        centroids.append((cx,cy))
+        areas.append(float(d.area))
+
+    # --- shape stability (IoU) ---
+    ious=[]
+    for i in range(len(masks)-1):
+        a=masks[i]
+        b=masks[i+1]
+        inter=np.logical_and(a,b).sum()
+        union=np.logical_or(a,b).sum()+1e-6
+        ious.append(inter/union)
+    shape_stab=float(np.mean(ious)) if ious else 1.0
+
+    # --- motion ---
+    cxs=np.array([c[0] for c in centroids])
+    cys=np.array([c[1] for c in centroids])
+    motion=float(np.mean(np.sqrt(np.diff(cxs,prepend=cxs[0])**2 + np.diff(cys,prepend=cys[0])**2)))
+
+    mean_area=max(1e-6,np.mean(areas))
+    motion_norm=motion/np.sqrt(mean_area)
+
+    # --- area stability ---
+    area_std=float(np.std(areas)/mean_area)
+
+    # --- classification ---
+    if shape_stab>0.88 and motion_norm<2.0 and area_std<0.15:
+        cat="static"
+    elif shape_stab>0.6 and motion_norm<10.0:
+        cat="semi"
+    else:
+        cat="dynamic"
+
+    return cat, motion_norm, area_std
+
+
+
+def build_frame_object_masks(assigns_per_frame, h, w):
+    import numpy as _np
+    frame_obj = {}
+    for t, amap in enumerate(assigns_per_frame):
+        m = _np.zeros((h, w), _np.uint8)
+        for _, seg in amap.items():
+            try:
+                m |= (seg.mask01 > 0).astype(_np.uint8)
+            except Exception:
+                pass
+        frame_obj[t] = m
+    return frame_obj
+
+
 
 def run(args: argparse.Namespace) -> int:
     import numpy as np
@@ -62,7 +135,7 @@ def run(args: argparse.Namespace) -> int:
             save_jpg(base_dir / "aligned_preview" / f"aligned_{i:03d}.jpg", im, q=90)
 
     base = argmax_focus_stack(imgs_al, ksize=args.sharp_ksize)
-    save_png(out_dir / "base_stack.png", base)
+    save_jpg(out_dir / "base_stack.png", base)
 
     device = "cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     fp16 = bool(args.fp16) and device == "cuda"
@@ -210,37 +283,110 @@ def run(args: argparse.Namespace) -> int:
         is_bg = (area / float(h * w)) >= args.bg_area_ratio
         packs.append(ObjPack(ref_id=tr.track_id, track=tr, best_t=bt, best_s=bs, final_mask=m, area=area, is_bg=is_bg))
 
+    # --- FORCE FINAL INIT (stable) ---
+    # --- Replaced FG/BG logic with classification + patch-first pipeline ---
+    # classify tracks and mark packs
     for p in packs:
+        p.category, p.pos_std, p.rel_area = classify_track(
+            p.track, h, w,
+            args.class_pos_thresh,
+            args.class_area_thresh
+        )
+
+        if len(p.track.dets) < args.min_track_len or p.area < args.min_area:
+            p.category = "rejected"
+
         obj_dir = objs_dir / f"obj_{p.ref_id:03d}"
-        save_mask(obj_dir / "final_mask.png", p.final_mask)
-        if args.save_previews:
+        obj_dir.mkdir(parents=True, exist_ok=True)
+
+        meta = {
+            "ref_id": int(p.ref_id),
+            "best_t": int(p.best_t),
+            "best_score": float(p.best_s),
+            "area": int(p.area),
+            "category": p.category,
+            "track_len": int(len(p.track.dets)),
+            "pos_std": float(getattr(p, 'pos_std', 0.0)),
+            "rel_area": float(getattr(p, 'rel_area', 0.0))
+        }
+
+        import json
+        (obj_dir / "meta.json").write_text(
+            json.dumps(meta, indent=2),
+            encoding="utf-8"
+        )
+
+        # build masks by category for patching
+    masks_by_category = build_masks_by_category(packs, len(imgs_al), h, w)
+
+    import numpy as _np
+    coverage = _np.zeros((h, w), _np.uint8)
+
+    for p in packs:
+        if getattr(p, 'category', '') == 'rejected':
+            continue
+        coverage |= (p.final_mask > 0).astype(_np.uint8)
+
+    holes_mask = (coverage == 0).astype(_np.uint8)
+
+    if args.debug_images:
+        save_png(out_dir / "debug" / "coverage.png", (coverage * 255).astype(_np.uint8))
+        save_png(out_dir / "debug" / "holes.png", (holes_mask * 255).astype(_np.uint8))
+
+    # === BUILD BACKGROUND ===
+    patched = patch_fill_background(
+        imgs_al,
+        holes_mask,
+        masks_by_category,
+        mask_expand=args.mask_expand,
+        debug=bool(args.debug_images),
+        base=base
+    )
+
+    final_bg = base.copy()
+    mask_holes = (holes_mask > 0)
+    final_bg[mask_holes] = patched[mask_holes]
+
+    if args.debug_images:
+        save_png(out_dir / "debug" / "pre_patch.png", base)
+        save_png(out_dir / "debug" / "post_patch.png", final_bg)
+
+    # === FINAL INIT FROM BACKGROUND ===
+    final = final_bg.copy()
+
+    # === COMPOSE OBJECTS ===
+    order = ["static", "semi", "dynamic"]
+
+    for cls in order:
+        cls_packs = [pp for pp in packs if getattr(pp, 'category', '') == cls]
+        cls_packs_sorted = sorted(
+            cls_packs,
+            key=lambda x: (x.best_s, x.area)
+        )
+
+        for p in cls_packs_sorted:
             src = imgs_al[p.best_t]
-            from .overlay import overlay_masks
-            prev = overlay_masks(src, [p.final_mask], ids=[p.ref_id], alpha=0.45)
-            save_jpg(obj_dir / "previews" / f"best_t{p.best_t:03d}_finalmask.jpg", prev, q=92)
+            final = hard_paste_then_feather(
+                final,
+                src,
+                p.final_mask,
+                feather=args.feather_fg
+            )
 
-    bg = sorted([p for p in packs if p.is_bg], key=lambda x: (x.best_s, x.area), reverse=True)
-    fg = sorted([p for p in packs if not p.is_bg], key=lambda x: (x.best_s, x.area), reverse=True)
-
+    # summary
     lines = []
-    for p in bg:
-        lines.append(f"BG id={p.ref_id} len={len(p.track.dets)} best_t={p.best_t} best_score={p.best_s:.4f} area={p.area}")
-    for p in fg:
-        lines.append(f"FG id={p.ref_id} len={len(p.track.dets)} best_t={p.best_t} best_score={p.best_s:.4f} area={p.area}")
+    for p in packs:
+        lines.append(
+            f"{getattr(p, 'category', 'unknown').upper()} "
+            f"id={p.ref_id} len={len(p.track.dets)} "
+            f"best_t={p.best_t} best_score={p.best_s:.4f} area={p.area}"
+        )
+
     (out_dir / "tracks_summary.txt").write_text("\n".join(lines), encoding="utf-8")
 
-    final = base.copy()
-
-    for p in bg:
-        src = imgs_al[p.best_t]
-        final = hard_paste_then_feather(final, src, p.final_mask, feather=args.feather_bg)
-
-    for p in fg:
-        src = imgs_al[p.best_t]
-        final = hard_paste_then_feather(final, src, p.final_mask, feather=args.feather_fg)
-
-    save_png(out_dir / "final.png", final)
+    save_jpg(out_dir / "final.png", final)
     return 0
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("focusstack_object_pipeline_fastsam_gpu")
@@ -259,6 +405,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ecc_eps", type=float, default=1e-6)
 
     p.add_argument("--save_previews", type=int, default=1)
+
+    p.add_argument("--class_pos_thresh", type=float, default=2.0)
+    p.add_argument("--class_area_thresh", type=float, default=0.15)
+    p.add_argument("--min_track_len", type=int, default=2)
+    p.add_argument("--debug_images", type=int, default=0)
 
     p.add_argument("--fastsam_model", default="FastSAM-s.pt")
     p.add_argument("--imgsz", type=int, default=768)
@@ -283,32 +434,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--sharp_ksize", type=int, default=3)
 
-    # stabilizacja / corefill (zostawione)
     p.add_argument("--core_thr", type=float, default=0.82)
     p.add_argument("--fill_thr", type=float, default=0.62)
     p.add_argument("--max_fill_dist", type=int, default=18)
     p.add_argument("--stab_open_k", type=int, default=3)
     p.add_argument("--stab_close_k", type=int, default=5)
 
-    # NOWE: tryb maski
     p.add_argument("--mask_mode", choices=["union", "corefill"], default="union")
 
-    # union settings
     p.add_argument("--union_skip_area_ratio", type=float, default=0.90)
     p.add_argument("--union_hole_fill", type=int, default=0)
 
-    # clamp union do okolicy best klatki
     p.add_argument("--union_clamp", type=int, default=1)
     p.add_argument("--clamp_kernel", type=int, default=11)
     p.add_argument("--clamp_iters", type=int, default=2)
 
-    # kompozycja
     p.add_argument("--bg_area_ratio", type=float, default=0.35)
     p.add_argument("--feather_bg", type=int, default=13)
     p.add_argument("--feather_fg", type=int, default=21)
+    p.add_argument("--mask_expand", type=int, default=8)
+    p.add_argument("--min_presence_frac", type=float, default=0.55)
 
     return p
 
+
 if __name__ == "__main__":
     import sys
+
     sys.exit(run(build_parser().parse_args()))
